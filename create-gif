@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+#
+# create-gif.sh — Convert a video to a high-quality animated GIF using
+# FFmpeg's two-pass palette method (palettegen + paletteuse).
+#
+# MIT License
+#
+# Copyright (c) 2026 Jampants
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+
+set -euo pipefail
+
+readonly PROG="${0##*/}"
+readonly VERSION="1.0.0"
+readonly TMPDIR_BASE="${TMPDIR:-/tmp}"
+
+# ----------------------------- defaults -------------------------------------
+
+OUTPUT=""
+START_TIME=""
+DURATION=""
+WIDTH="720"
+FPS="12"
+COLORS="256"
+DITHER="sierra2_4a"
+STATS_MODE="diff"
+DIFF_MODE="rectangle"
+LOOP="0"
+VERBOSE=0
+QUIET=0
+
+# ----------------------------- helpers --------------------------------------
+
+die()   { printf '%s: error: %s\n'   "$PROG" "$*" >&2; exit 1; }
+warn()  { (( QUIET )) || printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+info()  { (( QUIET )) || printf '%s: %s\n'          "$PROG" "$*" >&2; }
+debug() { (( VERBOSE )) && printf '%s: debug: %s\n' "$PROG" "$*" >&2 || true; }
+
+usage() {
+    cat <<EOF
+Usage: $PROG [OPTIONS] INPUT
+
+Convert a video file to a high-quality animated GIF using FFmpeg's
+two-pass palette method.
+
+Options:
+  -o, --output FILE     Output GIF path (default: INPUT with .gif suffix)
+  -s, --start TIME      Start time (e.g. 00:00:02 or 2.5)
+  -d, --duration TIME   Clip duration in seconds or HH:MM:SS
+  -w, --width PX        Output width in pixels, or 'auto' (default: 720)
+  -f, --fps FPS         Output frame rate (default: 12)
+  -c, --colors N        Palette size, 2-256 (default: 256)
+      --dither METHOD   Dither: sierra2_4a|sierra2|bayer|floyd_steinberg|none
+                        (default: sierra2_4a)
+      --stats MODE      Palette stats mode: diff|full (default: diff)
+      --diff-mode MODE  Palette-use diff mode: rectangle|none (default: rectangle)
+      --loop N          Loop count: 0=infinite, -1=once, N=N times (default: 0)
+  -v, --verbose         Verbose output
+  -q, --quiet           Suppress non-error output
+  -h, --help            Show this help and exit
+  -V, --version         Show version and exit
+
+Examples:
+  $PROG video.mp4
+  $PROG -o clip.gif -s 00:00:05 -d 3 -w 480 -f 15 video.mkv
+  $PROG --width auto --fps 20 --colors 128 video.mp4
+EOF
+}
+
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_int()  { [[ "$1" =~ ^-?[0-9]+$ ]]; }
+is_time() { [[ -n "$1" && "$1" != -* && "$1" =~ ^[0-9:.]+$ ]]; }
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+default_output() {
+    local input=$1 base dir
+    dir=$(dirname  -- "$input")
+    base=$(basename -- "$input")
+    # Strip a trailing ".ext" only if there's a non-empty stem.
+    if [[ "$base" == *.* && "${base%.*}" != "" ]]; then
+        base="${base%.*}"
+    fi
+    if [[ "$dir" == "." ]]; then
+        printf '%s.gif\n' "$base"
+    else
+        printf '%s/%s.gif\n' "$dir" "$base"
+    fi
+}
+
+# ----------------------------- arg parsing ----------------------------------
+
+POSITIONAL=()
+while (( $# )); do
+    case "$1" in
+        -h|--help)      usage; exit 0 ;;
+        -V|--version)   printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+
+        -o|--output)    [[ -n "${2:-}" ]] || die "$1 requires an argument"; OUTPUT=$2;     shift 2 ;;
+        -s|--start)     [[ -n "${2:-}" ]] || die "$1 requires an argument"; START_TIME=$2; shift 2 ;;
+        -d|--duration)  [[ -n "${2:-}" ]] || die "$1 requires an argument"; DURATION=$2;   shift 2 ;;
+        -w|--width)     [[ -n "${2:-}" ]] || die "$1 requires an argument"; WIDTH=$2;      shift 2 ;;
+        -f|--fps)       [[ -n "${2:-}" ]] || die "$1 requires an argument"; FPS=$2;        shift 2 ;;
+        -c|--colors)    [[ -n "${2:-}" ]] || die "$1 requires an argument"; COLORS=$2;     shift 2 ;;
+        --dither)       [[ -n "${2:-}" ]] || die "$1 requires an argument"; DITHER=$2;     shift 2 ;;
+        --stats)        [[ -n "${2:-}" ]] || die "$1 requires an argument"; STATS_MODE=$2; shift 2 ;;
+        --diff-mode)    [[ -n "${2:-}" ]] || die "$1 requires an argument"; DIFF_MODE=$2;  shift 2 ;;
+        --loop)         [[ -n "${2:-}" ]] || die "$1 requires an argument"; LOOP=$2;       shift 2 ;;
+
+        --output=*)     OUTPUT=${1#*=};     shift ;;
+        --start=*)      START_TIME=${1#*=}; shift ;;
+        --duration=*)   DURATION=${1#*=};   shift ;;
+        --width=*)      WIDTH=${1#*=};      shift ;;
+        --fps=*)        FPS=${1#*=};        shift ;;
+        --colors=*)     COLORS=${1#*=};     shift ;;
+        --dither=*)     DITHER=${1#*=};     shift ;;
+        --stats=*)      STATS_MODE=${1#*=}; shift ;;
+        --diff-mode=*)  DIFF_MODE=${1#*=};  shift ;;
+        --loop=*)       LOOP=${1#*=};       shift ;;
+
+        -v|--verbose)   VERBOSE=1; shift ;;
+        -q|--quiet)     QUIET=1;   shift ;;
+        --)             shift; POSITIONAL+=("$@"); break ;;
+        -*)             die "unknown option: $1 (try --help)" ;;
+        *)              POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+INPUT="${1:-}"
+
+# ----------------------------- validation -----------------------------------
+
+[[ -n "$INPUT" ]] || { usage >&2; exit 2; }
+(( ${#POSITIONAL[@]} <= 1 )) || die "only one INPUT argument is allowed"
+[[ -f "$INPUT" ]] || die "input file not found: $INPUT"
+[[ -r "$INPUT" ]] || die "input file not readable: $INPUT"
+
+if [[ "$WIDTH" != "auto" ]]; then
+    is_uint "$WIDTH" && (( WIDTH > 0 )) || die "--width: positive integer or 'auto'"
+fi
+is_uint "$FPS"    && (( FPS > 0 ))    || die "--fps: must be a positive integer"
+is_uint "$COLORS" && (( COLORS >= 2 && COLORS <= 256 )) \
+    || die "--colors: integer between 2 and 256"
+is_int "$LOOP" || die "--loop: must be an integer"
+
+case "$DITHER"    in sierra2_4a|sierra2|bayer|floyd_steinberg|none) ;; *) die "--dither: invalid value '$DITHER'" ;; esac
+case "$STATS_MODE" in diff|full) ;; *) die "--stats: must be 'diff' or 'full'" ;; esac
+case "$DIFF_MODE"  in rectangle|none) ;; *) die "--diff-mode: must be 'rectangle' or 'none'" ;; esac
+
+[[ -z "$START_TIME" || $(is_time "$START_TIME" && echo ok) == ok ]] || die "--start: invalid time '$START_TIME'"
+[[ -z "$DURATION"   || $(is_time "$DURATION"   && echo ok) == ok ]] || die "--duration: invalid time '$DURATION'"
+
+# ----------------------------- preparation ----------------------------------
+
+require_cmd ffmpeg
+
+[[ -n "$OUTPUT" ]] || OUTPUT=$(default_output "$INPUT")
+
+OUT_DIR=$(dirname -- "$OUTPUT")
+[[ -d "$OUT_DIR" ]] || die "output directory does not exist: $OUT_DIR"
+
+WORKDIR=$(mktemp -d "${TMPDIR_BASE%/}/create_gif.XXXXXX")
+PALETTE_FILE="$WORKDIR/palette.png"
+cleanup() { rm -rf -- "$WORKDIR"; }
+trap cleanup EXIT
+
+# FFmpeg verbosity.
+if   (( QUIET ));   then FF_LOG=(-nostats -loglevel error)
+elif (( VERBOSE )); then FF_LOG=(-loglevel info)
+else                     FF_LOG=(-nostats -loglevel warning)
+fi
+
+# Trim arguments (placed before -i for fast seek; identical in both passes).
+SEEK_ARGS=()
+[[ -n "$START_TIME" ]] && SEEK_ARGS+=(-ss "$START_TIME")
+[[ -n "$DURATION"   ]] && SEEK_ARGS+=(-t  "$DURATION")
+
+# Filter fragments.
+if [[ "$WIDTH" == "auto" ]]; then
+    SCALE_FILTER=""
+else
+    SCALE_FILTER="scale=${WIDTH}:-1:flags=lanczos"
+fi
+
+PALETTE_GEN="fps=$FPS"
+[[ -n "$SCALE_FILTER" ]] && PALETTE_GEN+=",$SCALE_FILTER"
+PALETTE_GEN+=",palettegen=max_colors=$COLORS:stats_mode=$STATS_MODE"
+
+FILTER_COMPLEX="fps=$FPS"
+[[ -n "$SCALE_FILTER" ]] && FILTER_COMPLEX+=",$SCALE_FILTER"
+FILTER_COMPLEX+="[x];[x][1:v]paletteuse=dither=$DITHER"
+[[ "$DIFF_MODE" != "none" ]] && FILTER_COMPLEX+=":diff_mode=$DIFF_MODE"
+
+# Wrapper that transparently adds seek args when present (safe for empty array).
+run_ffmpeg() {
+    if (( ${#SEEK_ARGS[@]} )); then
+        ffmpeg "${FF_LOG[@]}" "${SEEK_ARGS[@]}" "$@"
+    else
+        ffmpeg "${FF_LOG[@]}" "$@"
+    fi
+}
+
+# ----------------------------- summary --------------------------------------
+
+info "input:    $INPUT"
+info "output:   $OUTPUT"
+info "start:    ${START_TIME:-<beginning>}"
+info "duration: ${DURATION:-<full>}"
+info "width:    $WIDTH"
+info "fps:      $FPS"
+info "colors:   $COLORS"
+info "dither:   $DITHER"
+info "loop:     $LOOP"
+
+# ----------------------------- run ffmpeg -----------------------------------
+
+info "pass 1/2: generating palette..."
+debug "filter: $PALETTE_GEN"
+run_ffmpeg -y -i "$INPUT" -vf "$PALETTE_GEN" "$PALETTE_FILE"
+
+info "pass 2/2: rendering GIF..."
+debug "filter_complex: $FILTER_COMPLEX"
+run_ffmpeg -y -i "$INPUT" -i "$PALETTE_FILE" \
+    -filter_complex "$FILTER_COMPLEX" \
+    -loop "$LOOP" \
+    "$OUTPUT"
+
+info "done: $OUTPUT"
