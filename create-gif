@@ -208,7 +208,7 @@ PALETTE_GEN+=",palettegen=max_colors=$COLORS:stats_mode=$STATS_MODE"
 
 FILTER_COMPLEX="fps=$FPS"
 [[ -n "$SCALE_FILTER" ]] && FILTER_COMPLEX+=",$SCALE_FILTER"
-FILTER_COMPLEX+="[x];[x][1:v]paletteuse=dither=$DITHER"
+FILTER_COMPLEX+="[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
 [[ "$DIFF_MODE" != "none" ]] && FILTER_COMPLEX+=":diff_mode=$DIFF_MODE"
 
 # Wrapper that transparently adds seek args when present (safe for empty array).
